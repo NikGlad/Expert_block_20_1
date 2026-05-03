@@ -1,0 +1,916 @@
+(vl-load-com)
+
+(setq *er-layer* "экспертиза")
+(setq *er-dim-layer* "экспертиза обмеры")
+(setq *er-ray-len* 50000.0)
+(setq *er-ray-color-aci* 1)
+(setq *er-yellow-aci* 2)
+(setq *er-yellow-truecolor* 16776960)
+(setq *er-orange-aci* 30)
+(setq *er-orange-truecolor* 16744192)
+
+(setq *er-items*
+  '(
+    ("p1"  "Здания больниц Ф1.1" "2" "STD" nil)
+    ("p2"  "Здания больниц Ф1.1 высотой более 28 м." "1" "DIM_GT" 28000.0)
+    ("p3"  "Детские сады Ф1.1 с числом мест более 350." "3" "STD" nil)
+    ("p4"  "Детские сады Ф1.1 с количеством этажей более трёх и высотой более 9 метров." "4" "DIM_GT" 9000.0)
+    ("p5"  "Детские сады Ф1.1 с количеством этажей три и более." ("5" "6" "7") "STD" nil)
+    ("p8"  "Детские сады Ф1.1 специализированные ДОО компенсирующего вида." "8" "STD" nil)
+    ("p9"  "Детские сады Ф1.1 ДОО для детей с нарушением зрения." "9" "STD" nil)
+    ("p10" "Спортивные трибуны Ф2.3 любой вместимости." "10" "STD" nil)
+    ("p11" "Зрительные залы, актовые залы и конференц-залы, трибуны." "11" "CLOUD_ORANGE" nil)
+    ("p12" "Зрительные залы, актовые залы и конференц-залы, трибуны после расчётов времени эвакуации." "12" "CLOUD_ORANGE" nil)
+    ("p13" "Зрительные залы, актовые залы и конференц-залы, трибуны в зданиях (Ф1.1) выше второго этажа и в зданиях школ (Ф4.1) выше третьего этажа." "13" "CLOUD_ORANGE" nil)
+    ("p14" "Зрительные залы, актовые залы и конференц-залы, трибуны, планшеты сцен." "14" "CLOUD_ORANGE" nil)
+    ("p15" "Школы Ф4.1." ("15" "16") "STD" nil)
+    ("p17" "Зрительные залы, актовые залы и конференц-залы в зданиях школ Ф4.1." "17" "CLOUD_ORANGE" nil)
+   )
+)
+
+(setq *er-selected-keys* nil)
+(setq *er-post-layer-handles* nil)
+
+(defun er-layer-exists-p (lay)
+  (not (null (tblsearch "LAYER" lay)))
+)
+
+(defun er-str-eq-ci (a b)
+  (= (strcase (if a a "")) (strcase (if b b "")))
+)
+
+(defun er-clamp (v a b)
+  (max a (min b v))
+)
+
+(defun er-pt->str (pt)
+  (if (and pt (listp pt))
+    (strcat "(" (rtos (car pt) 2 2) ", " (rtos (cadr pt) 2 2) ")")
+    "(nil)"
+  )
+)
+
+(defun er-anyarray->list (x / r)
+  (setq r (vl-catch-all-apply 'vlax-variant-value (list x)))
+  (if (vl-catch-all-error-p r)
+    (setq r x)
+  )
+  (setq r (vl-catch-all-apply 'vlax-safearray->list (list r)))
+  (if (vl-catch-all-error-p r)
+    nil
+    r
+  )
+)
+
+(defun er-normalize-blocks (blkref)
+  (if (listp blkref)
+    blkref
+    (list blkref)
+  )
+)
+
+(defun er-temp-dcl-path (/ p)
+  (setq p (getenv "TEMP"))
+  (if (or (null p) (= p ""))
+    (setq p ".")
+  )
+  (if (not (vl-file-directory-p p))
+    (setq p ".")
+  )
+  (strcat p "\\block_20_1_dialog.dcl")
+)
+
+(defun er-write-dcl-file (path / f item)
+  (setq f (open path "w" "utf8-bom"))
+  (if f
+    (progn
+      (write-line "expert_rays : dialog {" f)
+      (write-line "  label = \"Блок 20.1\";" f)
+      (write-line "  : column {" f)
+      (write-line "    : boxed_column {" f)
+      (write-line "      label = \"Выберите параметры\";" f)
+
+      (foreach item *er-items*
+        (write-line
+          (strcat
+            "      : toggle { key = \"" (car item) "\"; label = \"" (cadr item) "\"; }"
+          )
+          f
+        )
+      )
+
+      (write-line "    }" f)
+      (write-line "    : spacer { height = 1; }" f)
+      (write-line "    : row {" f)
+      (write-line "      : spacer { width = 1; }" f)
+      (write-line "      : button { key = \"accept\"; label = \"OK\"; is_default = true; width = 12; }" f)
+      (write-line "      : button { key = \"cancel\"; label = \"Отмена\"; is_cancel = true; width = 12; }" f)
+      (write-line "      : spacer { width = 1; }" f)
+      (write-line "    }" f)
+      (write-line "  }" f)
+      (write-line "}" f)
+      (close f)
+      path
+    )
+    nil
+  )
+)
+
+(defun er-capture-dialog (/ item key)
+  (setq *er-selected-keys* '())
+  (foreach item *er-items*
+    (setq key (car item))
+    (if (= (get_tile key) "1")
+      (setq *er-selected-keys* (append *er-selected-keys* (list key)))
+    )
+  )
+  (princ)
+)
+
+(defun er-show-dialog (/ dclfile dclid result sels item)
+  (setq sels '())
+  (setq *er-selected-keys* '())
+  (setq dclfile (er-write-dcl-file (er-temp-dcl-path)))
+
+  (if (null dclfile)
+    'ER_DCLERR
+    (progn
+      (setq dclid (load_dialog dclfile))
+      (if (or (null dclid) (< dclid 0))
+        (progn
+          (if (findfile dclfile) (vl-file-delete dclfile))
+          'ER_DCLERR
+        )
+        (progn
+          (if (not (new_dialog "expert_rays" dclid))
+            (progn
+              (unload_dialog dclid)
+              (if (findfile dclfile) (vl-file-delete dclfile))
+              'ER_DCLERR
+            )
+            (progn
+              (foreach item *er-items*
+                (set_tile (car item) "0")
+              )
+
+              (action_tile "accept" "(progn (er-capture-dialog) (done_dialog 1))")
+              (action_tile "cancel" "(done_dialog 0)")
+
+              (setq result (start_dialog))
+
+              (unload_dialog dclid)
+              (if (findfile dclfile) (vl-file-delete dclfile))
+
+              (cond
+                ((= result 0)
+                  'ER_CANCEL
+                )
+                (T
+                  (foreach item *er-items*
+                    (if (member (car item) *er-selected-keys*)
+                      (setq sels (append sels (list item)))
+                    )
+                  )
+                  (if sels sels 'ER_EMPTY)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(defun er-get-active-space-object (/ acad doc)
+  (setq acad (vlax-get-acad-object))
+  (setq doc (vla-get-ActiveDocument acad))
+  (if (= 1 (getvar "CVPORT"))
+    (vla-get-PaperSpace doc)
+    (vla-get-ModelSpace doc)
+  )
+)
+
+(defun er-pts->lwpoly-variant (pts / arr idx pt)
+  (setq arr (vlax-make-safearray vlax-vbDouble (cons 0 (1- (* 2 (length pts))))))
+  (setq idx 0)
+  (foreach pt pts
+    (vlax-safearray-put-element arr idx (float (car pt)))
+    (setq idx (1+ idx))
+    (vlax-safearray-put-element arr idx (float (cadr pt)))
+    (setq idx (1+ idx))
+  )
+  (vlax-make-variant arr)
+)
+
+(defun er-draw-ray-polyline (p1 p2 / spaceObj var obj r)
+  (if (and p1 p2)
+    (progn
+      (setq spaceObj (er-get-active-space-object))
+      (setq var (er-pts->lwpoly-variant (list p1 p2)))
+      (setq r (vl-catch-all-apply 'vla-AddLightWeightPolyline (list spaceObj var)))
+      (if (vl-catch-all-error-p r)
+        nil
+        (progn
+          (setq obj r)
+          (vla-put-Layer obj *er-layer*)
+          (vla-put-Color obj *er-ray-color-aci*)
+          (vla-put-Linetype obj "ByLayer")
+          (vla-put-Lineweight obj -1)
+          (vla-Update obj)
+          obj
+        )
+      )
+    )
+    nil
+  )
+)
+
+(defun er-get-handle (ename / ed)
+  (setq ed (entget ename))
+  (cdr (assoc 5 ed))
+)
+
+(defun er-uniq-handle-add (lst h)
+  (if (and h (not (member h lst)))
+    (cons h lst)
+    lst
+  )
+)
+
+(defun er-mark-entity-for-post-layer (ename / h)
+  (setq h (er-get-handle ename))
+  (if h
+    (setq *er-post-layer-handles* (er-uniq-handle-add *er-post-layer-handles* h))
+  )
+  h
+)
+
+(defun er-set-entity-color-bylayer (ename / ed old62)
+  (if ename
+    (progn
+      (setq ed (entget ename))
+      (setq ed
+        (vl-remove-if
+          '(lambda (x) (or (= (car x) 420) (= (car x) 430)))
+          ed
+        )
+      )
+      (setq old62 (assoc 62 ed))
+      (if old62
+        (setq ed (subst (cons 62 256) old62 ed))
+        (setq ed (append ed (list (cons 62 256))))
+      )
+      (entmod ed)
+      (entupd ename)
+      T
+    )
+    nil
+  )
+)
+
+(defun er-move-entity-to-layer (ename lay / obj r)
+  (if (and ename lay)
+    (progn
+      (setq obj (vlax-ename->vla-object ename))
+      (setq r (vl-catch-all-apply 'vla-put-Layer (list obj lay)))
+      (if (vl-catch-all-error-p r)
+        nil
+        (progn
+          (er-set-entity-color-bylayer ename)
+          (vla-Update obj)
+          T
+        )
+      )
+    )
+    nil
+  )
+)
+
+(defun er-apply-post-layer-handles (/ cnt h en)
+  (setq cnt 0)
+  (foreach h (reverse *er-post-layer-handles*)
+    (setq en (handent h))
+    (if (and en (er-move-entity-to-layer en *er-layer*))
+      (setq cnt (1+ cnt))
+    )
+  )
+  cnt
+)
+
+(defun er-get-eff-name (ename / obj)
+  (setq obj (vlax-ename->vla-object ename))
+  (if (vlax-property-available-p obj 'EffectiveName)
+    (vla-get-EffectiveName obj)
+    (vla-get-Name obj)
+  )
+)
+
+(defun er-ent-inspt (ename / ed p)
+  (setq ed (entget ename))
+  (setq p (cdr (assoc 10 ed)))
+  p
+)
+
+(defun er-get-bbox (ename / obj r vmin vmax pmin pmax)
+  (setq obj (vlax-ename->vla-object ename))
+  (setq r (vl-catch-all-apply 'vla-GetBoundingBox (list obj 'vmin 'vmax)))
+  (if (vl-catch-all-error-p r)
+    nil
+    (progn
+      (setq pmin (er-anyarray->list vmin))
+      (setq pmax (er-anyarray->list vmax))
+      (if (and pmin pmax)
+        (list (car pmin) (cadr pmin) (car pmax) (cadr pmax))
+        nil
+      )
+    )
+  )
+)
+
+(defun er-get-bbox-center (ename / bb)
+  (setq bb (er-get-bbox ename))
+  (if bb
+    (list
+      (/ (+ (nth 0 bb) (nth 2 bb)) 2.0)
+      (/ (+ (nth 1 bb) (nth 3 bb)) 2.0)
+      0.0
+    )
+    nil
+  )
+)
+
+(defun er-right-edge-point (ename / bb xmin ymin xmax ymax)
+  (setq bb (er-get-bbox ename))
+  (if bb
+    (progn
+      (setq xmin (nth 0 bb))
+      (setq ymin (nth 1 bb))
+      (setq xmax (nth 2 bb))
+      (setq ymax (nth 3 bb))
+      (list xmax (/ (+ ymin ymax) 2.0) 0.0)
+    )
+    nil
+  )
+)
+
+(defun er-closest-point-on-bbox-boundary (pt bb / x y xmin ymin xmax ymax dxl dxr dyb dyt dmin)
+  (if (and pt bb)
+    (progn
+      (setq x    (car pt))
+      (setq y    (cadr pt))
+      (setq xmin (nth 0 bb))
+      (setq ymin (nth 1 bb))
+      (setq xmax (nth 2 bb))
+      (setq ymax (nth 3 bb))
+
+      (if (or (< x xmin) (> x xmax) (< y ymin) (> y ymax))
+        (list
+          (er-clamp x xmin xmax)
+          (er-clamp y ymin ymax)
+          0.0
+        )
+        (progn
+          (setq dxl (abs (- x xmin)))
+          (setq dxr (abs (- xmax x)))
+          (setq dyb (abs (- y ymin)))
+          (setq dyt (abs (- ymax y)))
+          (setq dmin (min dxl dxr dyb dyt))
+          (cond
+            ((= dmin dxl) (list xmin y 0.0))
+            ((= dmin dxr) (list xmax y 0.0))
+            ((= dmin dyb) (list x ymin 0.0))
+            (T            (list x ymax 0.0))
+          )
+        )
+      )
+    )
+    nil
+  )
+)
+
+(defun er-first-end-point (pt)
+  (if pt
+    (list
+      (+ (car pt) *er-ray-len*)
+      (cadr pt)
+      0.0
+    )
+    nil
+  )
+)
+
+(defun er-get-block-common-start (en anchor-end / bb)
+  (setq bb (er-get-bbox en))
+  (if bb
+    (if anchor-end
+      (er-closest-point-on-bbox-boundary anchor-end bb)
+      (er-right-edge-point en)
+    )
+    nil
+  )
+)
+
+(defun er-find-source-block (blkname / ss i en nm found)
+  (setq found nil)
+  (setq ss (ssget "X" (list (cons 0 "INSERT") (cons 8 *er-layer*))))
+
+  (if ss
+    (progn
+      (setq i 0)
+      (while (and (< i (sslength ss)) (null found))
+        (setq en (ssname ss i))
+        (setq nm (er-get-eff-name en))
+        (if (er-str-eq-ci nm blkname)
+          (setq found en)
+        )
+        (setq i (1+ i))
+      )
+    )
+  )
+  found
+)
+
+(defun er-layer-aci-color (lay / rec)
+  (setq rec (tblsearch "LAYER" lay))
+  (if rec
+    (cdr (assoc 62 rec))
+    nil
+  )
+)
+
+(defun er-entity-yellow-p (ename / ed c62 c420 lay layColor)
+  (setq ed (entget ename))
+  (setq c62 (cdr (assoc 62 ed)))
+  (setq c420 (cdr (assoc 420 ed)))
+  (setq lay (cdr (assoc 8 ed)))
+  (setq layColor (er-layer-aci-color lay))
+
+  (or
+    (= c420 *er-yellow-truecolor*)
+    (= c62 *er-yellow-aci*)
+    (and (or (null c62) (= c62 256)) (= layColor *er-yellow-aci*))
+  )
+)
+
+(defun er-entity-orange-p (ename / ed c62 c420 lay layColor)
+  (setq ed (entget ename))
+  (setq c62 (cdr (assoc 62 ed)))
+  (setq c420 (cdr (assoc 420 ed)))
+  (setq lay (cdr (assoc 8 ed)))
+  (setq layColor (er-layer-aci-color lay))
+
+  (or
+    (= c420 *er-orange-truecolor*)
+    (= c62 *er-orange-aci*)
+    (and (or (null c62) (= c62 256)) (= layColor *er-orange-aci*))
+  )
+)
+
+(defun er-get-dim-measurement (ename / obj val)
+  (setq obj (vlax-ename->vla-object ename))
+  (setq val (vl-catch-all-apply 'vla-get-Measurement (list obj)))
+  (if (vl-catch-all-error-p val)
+    0.0
+    (float val)
+  )
+)
+
+(defun er-get-dim-text-point (ename / obj val pt)
+  (setq obj (vlax-ename->vla-object ename))
+  (setq pt nil)
+
+  (if (vlax-property-available-p obj 'TextPosition)
+    (progn
+      (setq val (vl-catch-all-apply 'vla-get-TextPosition (list obj)))
+      (if (not (vl-catch-all-error-p val))
+        (setq pt (er-anyarray->list val))
+      )
+    )
+  )
+
+  (if (and pt (>= (length pt) 2))
+    (list (car pt) (cadr pt) 0.0)
+    nil
+  )
+)
+
+(defun er-get-dim-target-point (ename / pt)
+  (setq pt (er-get-dim-text-point ename))
+  (if pt
+    pt
+    (er-get-bbox-center ename)
+  )
+)
+
+(defun er-get-curve-closest-point (ename refPt / obj r pt)
+  (setq obj (vlax-ename->vla-object ename))
+  (setq r (vl-catch-all-apply 'vlax-curve-getClosestPointTo (list obj refPt)))
+  (if (vl-catch-all-error-p r)
+    nil
+    (if (and r (listp r) (>= (length r) 2))
+      (list (car r) (cadr r) 0.0)
+      nil
+    )
+  )
+)
+
+(defun er-get-cloud-target-point (cloudEn refPt / pt bb)
+  (setq pt (er-get-curve-closest-point cloudEn refPt))
+  (if pt
+    pt
+    (progn
+      (setq bb (er-get-bbox cloudEn))
+      (if (and bb refPt)
+        (er-closest-point-on-bbox-boundary refPt bb)
+        (er-get-bbox-center cloudEn)
+      )
+    )
+  )
+)
+
+(defun er-find-all-yellow-dims (/ ss i en out)
+  (setq out '())
+  (setq ss (ssget "X" (list (cons 0 "DIMENSION") (cons 8 *er-dim-layer*))))
+
+  (if ss
+    (progn
+      (setq i 0)
+      (while (< i (sslength ss))
+        (setq en (ssname ss i))
+        (if (er-entity-yellow-p en)
+          (setq out (cons en out))
+        )
+        (setq i (1+ i))
+      )
+    )
+  )
+
+  (reverse out)
+)
+
+(defun er-find-all-orange-clouds (/ ss i en typ out)
+  (setq out '())
+  (setq ss (ssget "X" (list (cons 8 *er-dim-layer*))))
+
+  (if ss
+    (progn
+      (setq i 0)
+      (while (< i (sslength ss))
+        (setq en (ssname ss i))
+        (setq typ (cdr (assoc 0 (entget en))))
+        (if (and
+              (er-entity-orange-p en)
+              (not (er-str-eq-ci typ "DIMENSION"))
+            )
+          (setq out (cons en out))
+        )
+        (setq i (1+ i))
+      )
+    )
+  )
+
+  (reverse out)
+)
+
+(defun er-build-standard-ray (startPt anchor-end / enpt obj)
+  (if startPt
+    (progn
+      (if anchor-end
+        (setq enpt anchor-end)
+        (setq enpt (er-first-end-point startPt))
+      )
+
+      (prompt
+        (strcat
+          "\n  Стандартный луч: "
+          (er-pt->str startPt)
+          " -> "
+          (er-pt->str enpt)
+        )
+      )
+
+      (setq obj (er-draw-ray-polyline startPt enpt))
+
+      (if obj
+        (list obj enpt)
+        nil
+      )
+    )
+    nil
+  )
+)
+
+(defun er-build-dim-ray (startPt dimEn / target obj)
+  (setq target (er-get-dim-target-point dimEn))
+
+  (if (and startPt target)
+    (progn
+      (prompt
+        (strcat
+          "\n  Луч к размеру: "
+          (er-pt->str startPt)
+          " -> "
+          (er-pt->str target)
+        )
+      )
+
+      (setq obj (er-draw-ray-polyline startPt target))
+      obj
+    )
+    nil
+  )
+)
+
+(defun er-build-cloud-ray (startPt cloudEn / target obj)
+  (setq target (er-get-cloud-target-point cloudEn startPt))
+
+  (if (and startPt target)
+    (progn
+      (prompt
+        (strcat
+          "\n  Луч к облаку: "
+          (er-pt->str startPt)
+          " -> "
+          (er-pt->str target)
+        )
+      )
+
+      (setq obj (er-draw-ray-polyline startPt target))
+      obj
+    )
+    nil
+  )
+)
+
+(defun er-process-dim-rule (en anchor-end threshold / dims dimEn dimVal startPt stdRes obj createdCount skippedCount newAnchor foundAbove)
+  (setq createdCount 0)
+  (setq skippedCount 0)
+  (setq newAnchor anchor-end)
+  (setq foundAbove nil)
+
+  (setq startPt (er-get-block-common-start en anchor-end))
+  (setq dims (er-find-all-yellow-dims))
+
+  (if startPt
+    (progn
+      (prompt (strcat "\n  Общая точка выхода лучей блока: " (er-pt->str startPt)))
+
+      (if dims
+        (progn
+          (prompt (strcat "\n  Найдено жёлтых размеров: " (itoa (length dims))))
+
+          (setq stdRes (er-build-standard-ray startPt anchor-end))
+          (if stdRes
+            (progn
+              (setq createdCount (1+ createdCount))
+              (if (null newAnchor)
+                (setq newAnchor (cadr stdRes))
+              )
+              (prompt "\n  Стандартный луч построен.")
+            )
+            (progn
+              (setq skippedCount (1+ skippedCount))
+              (prompt "\n  ОШИБКА: стандартный луч не создан.")
+            )
+          )
+
+          (foreach dimEn dims
+            (setq dimVal (er-get-dim-measurement dimEn))
+            (prompt (strcat "\n  Размер: " (rtos dimVal 2 2) " мм"))
+
+            (if (> dimVal threshold)
+              (progn
+                (setq foundAbove T)
+                (setq obj (er-build-dim-ray startPt dimEn))
+                (if obj
+                  (progn
+                    (setq createdCount (1+ createdCount))
+                    (er-mark-entity-for-post-layer dimEn)
+                    (prompt "\n  Дополнительный луч к размеру построен.")
+                  )
+                  (progn
+                    (setq skippedCount (1+ skippedCount))
+                    (prompt "\n  ОШИБКА: луч к размеру не создан.")
+                  )
+                )
+              )
+            )
+          )
+
+          (if (not foundAbove)
+            (prompt
+              (strcat
+                "\n  Размеров больше "
+                (rtos threshold 2 2)
+                " мм не найдено. Дополнительные лучи к размерам не строятся."
+              )
+            )
+          )
+        )
+        (progn
+          (prompt "\n  Жёлтые размеры в слое \"экспертиза обмеры\" не найдены. Строится только стандартный луч.")
+          (setq stdRes (er-build-standard-ray startPt anchor-end))
+          (if stdRes
+            (progn
+              (setq createdCount (1+ createdCount))
+              (if (null newAnchor)
+                (setq newAnchor (cadr stdRes))
+              )
+              (prompt "\n  Стандартный луч построен.")
+            )
+            (progn
+              (setq skippedCount (1+ skippedCount))
+              (prompt "\n  ОШИБКА: стандартный луч не создан.")
+            )
+          )
+        )
+      )
+    )
+    (progn
+      (setq skippedCount (1+ skippedCount))
+      (prompt "\n  ОШИБКА: не удалось определить общую точку выхода лучей блока.")
+    )
+  )
+
+  (list createdCount skippedCount newAnchor)
+)
+
+(defun er-process-cloud-rule (en anchor-end / clouds cloudEn obj createdCount skippedCount startPt)
+  (setq createdCount 0)
+  (setq skippedCount 0)
+  (setq startPt (er-get-block-common-start en anchor-end))
+  (setq clouds (er-find-all-orange-clouds))
+
+  (if startPt
+    (progn
+      (prompt (strcat "\n  Общая точка выхода лучей блока: " (er-pt->str startPt)))
+
+      (if clouds
+        (progn
+          (prompt (strcat "\n  Найдено оранжевых пометочных облаков: " (itoa (length clouds))))
+          (foreach cloudEn clouds
+            (setq obj (er-build-cloud-ray startPt cloudEn))
+            (if obj
+              (progn
+                (setq createdCount (1+ createdCount))
+                (er-mark-entity-for-post-layer cloudEn)
+                (prompt "\n  Луч к облаку построен.")
+              )
+              (progn
+                (setq skippedCount (1+ skippedCount))
+                (prompt "\n  ОШИБКА: луч к облаку не создан.")
+              )
+            )
+          )
+        )
+        (setq skippedCount (1+ skippedCount))
+      )
+    )
+    (progn
+      (setq skippedCount (1+ skippedCount))
+      (prompt "\n  ОШИБКА: не удалось определить общую точку выхода лучей блока.")
+    )
+  )
+
+  (list createdCount skippedCount)
+)
+
+(defun c:BLOCK_20_1 (/ sels anchor-end item key label blkref blklist blkname rule threshold en startPt stdRes created skipped res cloudRes movedCnt)
+  (setq sels (er-show-dialog))
+
+  (cond
+    ((eq sels 'ER_DCLERR)
+      (alert "Ошибка создания или загрузки диалога DCL.")
+    )
+
+    ((eq sels 'ER_CANCEL)
+      (prompt "\nОтменено.")
+    )
+
+    ((eq sels 'ER_EMPTY)
+      (alert "Не выбран ни один пункт.")
+    )
+
+    ((not (er-layer-exists-p *er-layer*))
+      (alert (strcat "Слой [" *er-layer* "] не найден."))
+    )
+
+    (T
+      (setq anchor-end nil)
+      (setq created 0)
+      (setq skipped 0)
+      (setq *er-post-layer-handles* nil)
+
+      (prompt (strcat "\nВыбрано пунктов: " (itoa (length sels))))
+
+      (foreach item sels
+        (setq key       (nth 0 item))
+        (setq label     (nth 1 item))
+        (setq blkref    (nth 2 item))
+        (setq rule      (nth 3 item))
+        (setq threshold (nth 4 item))
+        (setq blklist   (er-normalize-blocks blkref))
+
+        (prompt (strcat "\nПункт: " label))
+
+        (foreach blkname blklist
+          (prompt (strcat "\n  Обработка блока=" blkname))
+
+          (setq en (er-find-source-block blkname))
+
+          (if en
+            (cond
+              ((= rule "STD")
+                (setq startPt (er-get-block-common-start en anchor-end))
+                (if startPt
+                  (progn
+                    (prompt (strcat "\n  Общая точка выхода лучей блока: " (er-pt->str startPt)))
+                    (setq stdRes (er-build-standard-ray startPt anchor-end))
+                    (if stdRes
+                      (progn
+                        (setq created (1+ created))
+                        (if (null anchor-end)
+                          (setq anchor-end (cadr stdRes))
+                        )
+                        (prompt "\n  Луч построен.")
+                      )
+                      (progn
+                        (setq skipped (1+ skipped))
+                        (prompt "\n  ОШИБКА: стандартный луч не создан.")
+                      )
+                    )
+                  )
+                  (progn
+                    (setq skipped (1+ skipped))
+                    (prompt "\n  ОШИБКА: не удалось определить общую точку выхода лучей блока.")
+                  )
+                )
+              )
+
+              ((= rule "DIM_GT")
+                (setq res (er-process-dim-rule en anchor-end threshold))
+                (setq created (+ created (nth 0 res)))
+                (setq skipped (+ skipped (nth 1 res)))
+                (setq anchor-end (nth 2 res))
+              )
+
+              ((= rule "CLOUD_ORANGE")
+                (setq cloudRes (er-process-cloud-rule en anchor-end))
+                (setq created (+ created (nth 0 cloudRes)))
+                (setq skipped (+ skipped (nth 1 cloudRes)))
+                (if (= (nth 0 cloudRes) 0)
+                  (prompt "\n  Оранжевые пометочные облака не найдены.")
+                )
+              )
+
+              (T
+                (setq skipped (1+ skipped))
+                (prompt "\n  ОШИБКА: неизвестное правило обработки пункта.")
+              )
+            )
+
+            (progn
+              (setq skipped (1+ skipped))
+              (prompt
+                (strcat
+                  "\n  Блок ["
+                  blkname
+                  "] в слое ["
+                  *er-layer*
+                  "] не найден."
+                )
+              )
+            )
+          )
+        )
+      )
+
+      (setq movedCnt (er-apply-post-layer-handles))
+      (if (> movedCnt 0)
+        (prompt
+          (strcat
+            "\nПеренесено в слой \"экспертиза\" и переведено в цвет по слою объектов: "
+            (itoa movedCnt)
+          )
+        )
+      )
+
+      (prompt
+        (strcat
+          "\nГотово. Построено лучей: "
+          (itoa created)
+          (if (> skipped 0)
+            (strcat ". Пропущено операций: " (itoa skipped))
+            ""
+          )
+        )
+      )
+    )
+  )
+
+  (princ)
+)
+
+(princ "\nКоманда загружена: BLOCK_20_1")
+(princ)
